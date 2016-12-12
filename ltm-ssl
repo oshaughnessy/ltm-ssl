@@ -1,0 +1,1476 @@
+#!/usr/local/bin/python2.7 -u
+#
+# vim: set tabstop=4:shiftwidth=4:expandtab
+
+'''
+ltm-ssl
+
+Manage SSL certificates and profiles on F5 Local Traffic Managers
+
+This script uses the F5 iControl RESET interface. See also:
+https://devcentral.f5.com/wiki/iControlrest.HomePage.ashx
+
+'''
+
+import argparse
+import collections
+import copy
+import datetime
+import json
+import os
+import random
+import requests
+import signal
+import sys
+import tempfile
+import textwrap
+import time
+
+# https://docs.python.org/2/library/simplehttpserver.html
+import BaseHTTPServer
+import SimpleHTTPServer
+import SocketServer
+
+LTM_HOST = 'FIXME'
+LTM_USER = 'FIXME'
+LTM_PASS = 'FIXME'
+SSL_PROFILE_PARENT = 'clientssl-customer-instance'
+
+Verbose = 0
+
+
+class iControlREST:
+    """Manage an F5 Local Traffic Manager using the iControl REST protocol.
+    """
+
+    REST_PATHS = {
+        'clientssl': '/mgmt/tm/ltm/profile/clientSsl',
+        'clientssl_id': '/mgmt/tm/ltm/profile/clientSsl/~Common~{id}',
+        'crypto_cert': '/mgmt/tm/sys/crypto/cert',
+        'crypto_cert_id': '/mgmt/tm/sys/crypto/cert/{id}',
+        'crypto_key': '/mgmt/tm/sys/crypto/key',
+        'crypto_key_id': '/mgmt/tm/sys/crypto/key/{id}',
+        'file_sslcert': '/mgmt/tm/sys/file/sslCert',
+        'file_sslcert_id': '/mgmt/tm/sys/file/sslCert/~Common~{id}',
+        'file_sslkey': '/mgmt/tm/sys/file/sslKey',
+        'file_sslkey_id': '/mgmt/tm/sys/file/sslKey/~Common~{id}',
+        'transaction': '/mgmt/tm/transaction',
+        'transaction_id': '/mgmt/tm/transaction/{id}',
+        'virtual': '/mgmt/tm/ltm/virtual',
+        'virtual_id_443': '/mgmt/tm/ltm/virtual/~Common~{id}_443',
+        'virtual_profiles': '/mgmt/tm/ltm/virtual/~Common~{id}/profiles',
+        'virtual_profile': '/mgmt/tm/ltm/virtual/~Common~{id}/profiles/~Common~{profile}',
+    }
+
+    # Where do we store transitory files on the LTM?
+    # This probably won't ever need to change. It just needs to be unique to us.
+    LTM_TMP_PATH = '/var/tmp/ltm-ssl-'
+
+    # How many times should we try a REST request before giving up?
+    MAX_REQUEST_ATTEMPTS = 5
+
+    # If we get an unexpected error during a request, how many seconds
+    # should we wait before we try again?
+    RETRY_WAIT = 5
+
+
+    def __init__(self, verbose=0, user=None, password=None, hostname=None,
+                 http_scheme='https', ssl_profile_parent=None):
+        """Initialize a new iControlREST object.
+
+        Keyword arguments:
+        - verbose: integer that controls how much we talk about progress
+        - user: API authentication username
+        - password: API authentication password
+        - hostname: host or IP to which API calls will be sent
+        - http_scheme: "http" or "https"; defaults to "https"
+        - ssl_profile_parent: parent to assign to new SSL profiles
+        """
+
+        self.verbose = verbose
+        self.http_scheme = http_scheme
+        self.hostname = hostname
+        self.session = requests.Session()
+        self.session.headers.update({ 'Content-Type': 'application/json' })
+        self.virtual_profiles = collections.OrderedDict()
+        self.virtual_servers = collections.OrderedDict()
+        self.ssl_profile_parent = ssl_profile_parent
+        self.ssl_profiles = collections.OrderedDict()
+        self.ssl_certs = collections.OrderedDict()
+        self.ssl_keys = collections.OrderedDict()
+
+        if user and password:
+            self.session.auth = (user, password)
+
+        # don't verify the SSL certificate from the LTM
+        requests.packages.urllib3.disable_warnings()
+        self.session.verify = False
+
+
+    def icontrol_url(self, function, *args, **kwargs):
+        """Return the URL to call a iControl REST function.
+
+        Builds a string from the object's http_schem and hostname, which
+        were set during initialization. Passes any keyword arguments to
+        format(), where they can be used to fill in parts of the function
+        path taken from iControlREST.REST_PATHS[].
+
+        Arguments:
+        - function: name of the REST function to call, in lowercase.
+        """
+
+        path = self.REST_PATHS[function]
+        return self.http_scheme + '://' + self.hostname + path.format(**kwargs)
+
+
+    def send(self, method, url,
+             payload={},
+             result_name='kind',
+             success_code=requests.codes.ok, **kwargs):
+        """Send a REST API requst.
+
+        Arguments:
+        - method: 'DELETE', 'GET', 'PATCH', 'POST', or 'PUT'
+        - url: location to which the request will be sent
+
+        Keyword arguments:
+        - payload: hash of data to send in any request but GET or DELETE
+        - result_name: what index should we look for in the JSON response
+          that will indicate a success? The LTM seems to return "kind" with
+          just about any data request, so that's the default.
+        - success_code: what HTTP return code defines success?
+          This would normally be requests.codes.ok (200), but in the
+          case of a DELETE request, it will be 404.
+        - *: any other arguments are passed directly through to Requests
+        """
+
+        if self.verbose >= 3:
+            sys.stderr.write("\n    - {} {}\n".format(method, url))
+
+        if self.verbose >= 4 and payload != {}:
+            sys.stderr.write("\n    - {} payload: {}\n".format(method,
+                             gentlemanly_json(payload)))
+
+        for attempt in xrange(self.MAX_REQUEST_ATTEMPTS):
+            if self.verbose >= 3:
+                sys.stderr.write("\n        Attempt %s\n" % (attempt + 1))
+
+            try:
+                if method == 'GET':
+                    r = self.session.get(url, **kwargs)
+                elif method == 'DELETE':
+                    r = self.session.delete(url, **kwargs)
+                elif method == 'PATCH':
+                    r = self.session.patch(url, payload, **kwargs)
+                elif method == 'POST':
+                    r = self.session.post(url, payload, **kwargs)
+                elif method == 'PUT':
+                    r = self.session.put(url, payload, **kwargs)
+            except Exception as e:
+                sys.stderr.write("error when querying the device:\n")
+                for err in e:
+                    sys.stderr.write("    {}\n".format(err))
+                r = None
+
+            if r is not None:
+                try:
+                    if r.status_code != success_code:
+                        r.raise_for_status()
+                    #sys.stderr.write("    text: \"{}\"\n".format(r.text))
+                    try:
+                        rj = r.json()
+                    except:
+                        continue
+                    if result_name in rj:
+                        break
+                    elif r.status_code != success_status and 'errorStack' in rj:
+                        sys.stderr.write("error: {}\n".format(rj['message']))
+                        return None
+                except requests.exceptions.HTTPError as e:
+                    if r.status_code == 404:
+                        if self.verbose:
+                            sys.stderr.write("error: {} not found\n".format(
+                                             url))
+                    else:
+                        sys.stderr.write("unexpected error: {}\n".format(e))
+                    return None
+            else:
+                sys.stderr.write(("received unexpected reponse on attempt " +
+                                 "{attempt}; retrying in {retry}s\n").format(
+                                 attempt=attempt+1, retry=self.RETRY_WAIT))
+                if self.verbose >= 3 and r is not None:
+                    sys.stderr.write("result:\n{}\n".format(r.json()))
+                time.sleep(self.RETRY_WAIT)
+        else:
+            if r is not None:
+                sys.stderr.write("error: no valid response received; " +
+                                 "last reply:\n%s\n" % r.json())
+            else:
+                sys.stderr.write("error: no valid response received\n")
+            return None
+
+        if self.verbose >= 3:
+            sys.stdout.write("\n")
+        return r.json()
+
+
+    def DELETE(self, url, payload, result_name, **kwargs):
+        """Send an HTTP DELETE to the LTM
+
+        See the send() method for argument descriptions.
+        """
+
+        result = self.send('DELETE', url, payload, result_name,
+                           success_code=requests.codes.not_found, **kwargs)
+        if result is not None:
+            if 'code' in result and 'errorStack' in result:
+                if result['code'] == 404 and result['errorStack'] == []:
+                    return True
+            if self.verbose >= 3:
+                sys.stderr.write("suspicious DELETE reply:\n" +
+                                gentlemanly_json(result))
+            return result
+        else:
+            return result
+
+
+    def GET(self, url, result_name, **kwargs):
+        """Send an HTTP GET to the LTM
+
+        See the send() method for argument descriptions.
+        """
+
+        result = self.send('GET', url, result_name=result_name, **kwargs)
+        if result is not None:
+            if 'code' in result and 'errorStack' in result:
+                if self.verbose:
+                    sys.stderr.write("error: {}\n".format(result['errorStack']))
+                return False
+            if result_name not in result and self.verbose >= 3:
+                sys.stderr.write("suspicious GET reply:\n" +
+                                gentlemanly_json(result))
+            return result
+        else:
+            return False
+
+
+    def PATCH(self, url, payload, result_name, **kwargs):
+        """Send an HTTP PATCH to the LTM
+
+        See the send() method for argument descriptions.
+        """
+
+        result = self.send('PATCH', url, payload, result_name, **kwargs)
+        if result is not None:
+            if 'code' in result and 'errorStack' in result:
+                if self.verbose:
+                    sys.stderr.write("error: {}\n".format(result['errorStack']))
+                return False
+            if result_name not in result and self.verbose >= 3:
+                sys.stderr.write("suspicious PATCH reply:\n" +
+                                gentlemanly_json(result))
+            return result
+        else:
+            return False
+
+
+    def POST(self, url, payload, result_name, **kwargs):
+        """Send an HTTP POST to the LTM
+
+        See the send() method for argument descriptions.
+        """
+
+        result = self.send('POST', url, payload, result_name, **kwargs)
+        if result is not None:
+            if 'code' in result and 'errorStack' in result:
+                if self.verbose:
+                    sys.stderr.write("error: {}\n".format(result['errorStack']))
+                return False
+            if result_name not in result and self.verbose >= 3:
+                sys.stderr.write("suspicious POST reply:\n" +
+                                gentlemanly_json(result))
+            return result
+        else:
+            return False
+
+
+    def PUT(self, url, payload, result_name, **kwargs):
+        """Send an HTTP PUT to the LTM
+
+        See the send() method for argument descriptions.
+        """
+
+        result = self.send('PUT', url, payload, result_name, **kwargs)
+        if result is not None:
+            if 'code' in result and 'errorStack' in result:
+                if self.verbose:
+                    sys.stderr.write("error: {}\n".format(result['errorStack']))
+                return False
+            if result_name not in result and self.verbose >= 3:
+                sys.stderr.write("suspicious PUT reply:\n" +
+                                gentlemanly_json(result))
+            return result
+        else:
+            return False
+
+
+    def load_virtual_servers(self):
+        """Read a list of all the virtual servers on the LTM.
+
+        This script will only retain information on those with a
+        destination on port 443, just to avoid wasting memory on any
+        that aren't likely to be running an SSL service.
+        """
+
+        if self.verbose >= 2:
+            sys.stdout.write("* Loading all virtual servers\n")
+
+        self.virtual_servers = collections.OrderedDict()
+        url = self.icontrol_url('virtual')
+        results = self.GET(url, 'items')
+        if 'items' in results:
+            for item in results['items']:
+                #if self.verbose >= 2:
+                #    sys.stdout.write(("** retrieved virt server {}: {}\n"
+                #                     ).format(
+                #                      item['name'],
+                #                      item['destination']
+                #                     ))
+                if not item['destination'].endswith(':443'):
+                    continue
+                if self.verbose >= 3:
+                    sys.stdout.write("** ... remembering SSL server\n")
+                self.virtual_servers[item['name']] = item.copy()
+        else:
+            sys.stderr.write("error: no valid response received;" +
+                             "last reply:\n%s\n" % results)
+            return False
+
+        for s in self.virtual_servers.keys():
+            self.load_virtual_profiles(s)
+
+        return True
+
+
+    def load_virtual_profiles(self, name):
+        """Read all the profiles associated with a virtual server
+
+        Arguments:
+        - name: name of the virtual server
+        """
+
+        if self.verbose >= 3:
+            sys.stdout.write("* Loading virtual profiles for {}\n".format(name))
+
+        self.virtual_profiles[name] = collections.OrderedDict()
+        url = self.icontrol_url('virtual_profiles', id=name)
+        result = self.GET(url, 'items')
+        if result is False:
+            return None
+        elif 'items' in result:
+            for item in result['items']:
+                if self.verbose >= 3:
+                    sys.stdout.write(("** copying virt profile {}: {}\n"
+                                     ).format(item['name'], item.copy()))
+                self.virtual_profiles[name][item['name']] = item.copy()
+        else:
+            sys.stderr.write("error: no valid response received;" +
+                             "last reply:\n%s\n" % result)
+            return False
+        return True
+
+
+    def print_virtuals_with_profile(self, profile, context):
+        """Print a list of virtual servers with the given profile/context.
+
+        Arguments:
+        - profile: name of the profile to find in the list of servers
+        - context: context of profiles to display; passed directly through
+                   to print_virtual_profile()
+        """
+
+        for s in self.virtual_servers.viewkeys():
+            #print "* looking for {} in {}\n".format(profile, s)
+            if self.virtual_has_profile(s, profile):
+                print s
+
+
+    def print_virtual_profiles(self, context):
+        """Print information about every Virtual Server profile
+
+        Arguments:
+        - context: context of profiles to display; passed directly through
+                   to print_virtual_profile()
+        """
+
+        for s in self.virtual_servers.viewkeys():
+            self.print_virtual_profile(s, context)
+
+
+    def print_virtual_profile(self, name, context):
+        """Print all the details about a Virtual Server profile to stdout
+
+        Arguments:
+        - name: name of the virtual server
+        - context: context of profiles to display ('clientside',
+                   'serverside', or 'all')
+        """
+
+        if not self.has_virtual_profiles(name):
+            return False
+
+        if self.verbose:
+            sys.stdout.write("\n### Virtual server {}\n\n".format(name))
+
+            for p in self.virtual_profiles[name].viewvalues():
+                if context != p['context']:
+                    continue
+
+                sys.stdout.write("SSL profile {}:\n\n".format(p['name']))
+                for (k, v) in p.viewitems():
+                    sys.stdout.write("* {}={}\n".format(k, v))
+                sys.stdout.write("\n")
+        else:
+            sys.stdout.write("\n{}:\n\n".format(name))
+
+            for p in self.virtual_profiles[name].viewvalues():
+                if context != p['context']:
+                    continue
+                sys.stdout.write("* {}\n".format(p['name']))
+            sys.stdout.write("\n")
+
+
+    def load_ssl_profiles(self):
+        """Fetch and store details about all the SSL profiles on the LTM
+        """
+
+        if self.verbose >= 2:
+            sys.stdout.write("* Loading all SSL profiles\n")
+
+        url = self.icontrol_url('clientssl')
+        result = self.GET(url, 'items')
+        if 'items' in result:
+            for item in result['items']:
+                self.ssl_profiles[item['name']] = item.copy()
+        else:
+            sys.stderr.write("error: no valid response received;" +
+                             "last reply:\n%s\n" % result)
+            return False
+        return True
+
+
+    def load_ssl_certs(self):
+        """Fetch and store details about all the SSL certificates on the LTM
+        """
+
+        if self.verbose >= 2:
+            sys.stdout.write("* Loading all SSL certificate info\n")
+
+        url = self.icontrol_url('crypto_cert')
+        result = self.GET(url, 'items')
+        if 'items' in result:
+            for item in result['items']:
+                self.ssl_certs[item['name']] = item.copy()
+        else:
+            sys.stderr.write("error: no valid response received;" +
+                             "last reply:\n%s\n" % result)
+            return False
+        return True
+
+
+    def load_ssl_keys(self):
+        """Fetch and store details about all the SSL keys on the LTM
+        """
+
+        if self.verbose >= 2:
+            sys.stdout.write("* Loading all SSL key info\n")
+
+        url = self.icontrol_url('crypto_key')
+        result = self.GET(url, 'items')
+        if 'items' in result:
+            for item in result['items']:
+                self.ssl_keys[item['name']] = item.copy()
+        else:
+            sys.stderr.write("error: no valid response received;" +
+                             "last reply:\n%s\n" % result)
+            return False
+        return True
+
+
+    def virtual_has_profile(self, server, profile):
+        """Return whether the given virtual server has the given profile.
+
+        Parameters:
+        - server: server name of the virtual server to look up
+        - profile: server name of the profile to locate in that server's info
+        """
+
+        # return False if we don't know anything about the server
+        if server not in self.virtual_servers:
+            #print "server {} is not in virtual_servers".format(server)
+            return False
+
+        # return False if the virtual server doesn't have any profiles
+        # (seems weird... but possible?)
+        if server not in self.virtual_profiles:
+            #print "server {} is not in virtual_profiles".format(server)
+            return False
+
+        server_profiles = self.virtual_profiles[server]
+        if profile in server_profiles:
+            return True
+        else:
+            return False
+
+
+    def has_virtual_profiles(self, name):
+        """Return whether we have info on the profiles of the named server.
+
+        Parameters:
+        - name: server name of the profile to locate
+        """
+
+        if name in self.virtual_profiles:
+            return True
+        else:
+            return False
+
+
+    def has_ssl_cert(self, name):
+        """Return whether we have information about the named SSL certificate
+
+        Parameters:
+        - name: server name of the certificate to locate
+        """
+
+        if name+'.crt' in self.ssl_certs:
+            return True
+        else:
+            return False
+
+
+    def has_ssl_key(self, name):
+        """Return whether we have information about the named SSL key
+
+        Parameters:
+        - name: server name of the key to locate
+        """
+
+        if name+'.key' in self.ssl_keys:
+            return True
+        else:
+            return False
+
+
+    def has_ssl_profile(self, name):
+        """Return whether we have information about the named SSL profile
+
+        Parameters:
+        - name: server name of the profile to locate
+        """
+
+        if name in self.ssl_profiles:
+            return True
+        else:
+            return False
+
+
+    def print_ssl_profile(self, name):
+        """Write details about a profile to stdout
+
+        Parameters:
+        - name: server name of the profile to display
+        """
+
+        if name not in self.ssl_profiles:
+            return False
+        profile = self.ssl_profiles[name]
+        sys.stdout.write("\n## SSL profile {}\n\n".format(name))
+        for (k, v) in profile.viewitems():
+            sys.stdout.write("* {}={}\n".format(k, v))
+        return True
+
+
+    def print_ssl_status(self, name):
+        """Write a brief statement showing whether an SSL profile is enabled
+
+        Parameters:
+        - name: server name of the profile to display
+        """
+
+        if not self.has_ssl_profile(name):
+            return False
+        else:
+            profile = self.ssl_profiles[name]
+        sys.stdout.write("{}: {}\n".format(name, profile['mode']))
+        return True
+
+
+    def print_ssl_cert(self, name):
+        """Write details about an SSL certificate to stdout
+
+        Parameters:
+        - name: server name of the certificate to display
+        """
+
+        if not self.has_ssl_cert(name):
+            sys.stderr.write("SSL certificate for {} not found.\n".format(name))
+            return False
+        else:
+            cert = self.ssl_certs[name+'.crt']
+        sys.stdout.write("\n## SSL certificate {}\n\n".format(name))
+        for (k, v) in cert.viewitems():
+            sys.stdout.write("* {}={}\n".format(k, v))
+        return True
+
+
+    def print_ssl_key(self, name):
+        """Write details about an SSL key to stdout
+
+        Parameters:
+        - name: server name of the key to display
+        """
+
+        if not self.has_ssl_key(name):
+            sys.stderr.write("SSL key for {} not found.\n".format(name))
+            return False
+        else:
+            key = self.ssl_keys[name+'.key']
+        sys.stdout.write("\n## SSL key {}\n\n".format(name))
+        for (k, v) in key.viewitems():
+            sys.stdout.write("* {}={}\n".format(k, v))
+        return True
+
+
+    def add_virtual_profile(self, host, profile, context):
+        """Add a profile to a virtual server.
+
+        Positional arguments:
+        - host: name of a virtual server
+        - profile: name of a profile not already associated with that host
+        - context: the context to which the profile is applied ("clientside",
+                   "serverside", or "all".
+        """
+
+        payload = {
+            'kind': 'tm:ltm:virtual:profiles:profilesstate',
+            'name': profile,
+            'context': context,
+            'partition': 'Common',
+        }
+
+        url = self.icontrol_url('virtual_profiles', id=host)
+        result = self.POST(url, json.dumps(payload), 'generation')
+        if result is False:
+            sys.stderr.write("error: no valid response received\n")
+            return False
+        else:
+            return True
+
+
+    def delete_virtual_profile(self, host, profile):
+        """Remove a profile from a virtual server on the LTM.
+
+        Positional arguments:
+        - host: name of a virtual server
+        - profile: name of a profile already associated with that host
+        """
+
+        url = self.icontrol_url('virtual_profile', id=host,
+                                profile=profile)
+        return self.DELETE(url, '', 'code')
+
+
+    def get_crypto_cert(self, name=None):
+        """Get the details of an SSL certificate resource"
+
+        Keyword arguments:
+        - name: name of the certificate to load
+        """
+
+        # I don't know if this is a bug, but requesting .../crypto/cert/{id}
+        # and .../crypto/key/{id} doesn't work when you include "~Common~".
+        # If that part is stripped out, requests work, even though the
+        # reference URL includes that part.
+        if name:
+            if not name.endswith('.crt'):
+                name = name+'.crt'
+            relative_name = name.replace('~Common~', '')
+            url = self.icontrol_url('crypto_cert_id', id=relative_name)
+            return self.GET(url, 'name')
+        else:
+            return None
+
+
+    def add_crypto_cert(self, name=None, cert=None, chain=None):
+        """Copy and install an SSL certificate file (and chain)
+
+        Keyword arguments:
+        - name: name by which the certificate and chain will be referenced
+        - cert: path to a local file with the SSL certificate
+        - chain: path to a local file with the SSL intermediate certificates
+        """
+
+        dest_cert = None
+        return_status = True
+
+        # Create a temporary file that will hold all our cert components.
+        # We'll combine the cert and chain together then copy the result.
+        temp_cert = tempfile.NamedTemporaryFile()
+
+        if cert:
+            with open(cert, 'r') as f: cert_text = f.read()
+            if self.verbose >= 3:
+                sys.stdout.write("* appending {} to {}\n".format(cert,
+                                 temp_cert.name))
+            if self.verbose >= 4:
+                sys.stdout.write("\n## SSL certificate \"{}\":\n".format(cert))
+                sys.stdout.write("\n" + cert_text + "\n")
+            temp_cert.write(cert_text)
+
+        if chain:
+            with open(chain, 'r') as f: cert_text = f.read()
+            if self.verbose >= 3:
+                sys.stdout.write("* appending {} to {}\n".format(chain,
+                                 temp_cert.name))
+            if self.verbose >= 4:
+                sys.stdout.write("\n## SSL chain \"{}\":\n".format(cert))
+                sys.stdout.write("\n" + cert_text + "\n")
+            temp_cert.write(cert_text)
+
+        if temp_cert:
+            tmp_name = random.randint(100000, 999999)
+            dest_cert = '{}crt.{}'.format(self.LTM_TMP_PATH, tmp_name)
+            scp_cmd = 'scp -q \'{}\' \'{}:{}\''.format(temp_cert.name,
+                      self.hostname, dest_cert)
+            if self.verbose >= 3:
+                sys.stdout.write("* Uploading {} to {}\n".format(temp_cert.name,
+                                                                   dest_cert))
+            if self.verbose >= 4:
+                sys.stdout.write("\n    {}\n".format(scp_cmd))
+            os.system(scp_cmd)
+            cert_url = self.icontrol_url('crypto_cert')
+            cert_payload = {
+              'name': name,
+              'command': 'install',
+              'from-local-file': dest_cert,
+            }
+
+            result = self.POST(cert_url, json.dumps(cert_payload), 'kind')
+            if result is False:
+                sys.stderr.write("error: no valid response received\n")
+                return_status = False
+
+        # remove the files we uploaded to the LTM's temp dir
+        if dest_cert:
+            ssh_cmd = 'ssh {} rm {}'.format(self.hostname, dest_cert)
+            if self.verbose >= 3:
+                sys.stdout.write("* Removing {} from {}\n".format(dest_cert,
+                                 self.hostname))
+            if self.verbose >= 4:
+                sys.stdout.write("\n    {}\n".format(ssh_cmd))
+            os.system(ssh_cmd)
+
+        return return_status
+
+
+    def delete_crypto_cert(self, name=None):
+        """Delete an SSL certificate resource"
+
+        Keyword arguments:
+        - name: name of the cert to delete
+        """
+
+        if name:
+            if not name.endswith('.crt'):
+                name = name+'.crt'
+            url = self.icontrol_url('crypto_cert_id', id=name)
+            return self.DELETE(url, '', 'code')
+        else:
+            return None
+
+
+    def add_crypto_key(self, name=None, key=None):
+        """Copy and install an SSL key file
+
+        Keyword arguments:
+        - name: name by which the key will be referenced
+        - key: path to a local file with the unencrypted SSL key
+        """
+
+        dest_key = None
+        return_status = True
+
+        if key:
+            tmp_name = random.randint(100000, 999999)
+            dest_key = '{}key.{}'.format(self.LTM_TMP_PATH, tmp_name)
+            scp_cmd = 'scp -q \'{}\' \'{}:{}\''.format(key, self.hostname,
+                      dest_key)
+            if self.verbose >= 3:
+                sys.stdout.write("* Uploading {} to {}\n".format(key,
+                                                                   dest_key))
+            if self.verbose >= 4:
+                sys.stdout.write("\n    {}\n".format(scp_cmd))
+            os.system(scp_cmd)
+            key_url = self.icontrol_url('crypto_key')
+            key_payload = {
+              'name': name,
+              'command': 'install',
+              'from-local-file': dest_key,
+            }
+
+            result = self.POST(key_url, json.dumps(key_payload), 'kind')
+            if result is False:
+                sys.stderr.write("error: no valid response received\n")
+                return_status = False
+
+        if dest_key:
+            ssh_cmd = 'ssh {} rm {}'.format(self.hostname, dest_key)
+            if self.verbose >= 3:
+                sys.stdout.write("* Removing {} from {}\n".format(dest_key,
+                                 self.hostname))
+            if self.verbose >= 4:
+                sys.stdout.write("\n    {}\n".format(ssh_cmd))
+            os.system(ssh_cmd)
+
+        return return_status
+
+
+    def get_crypto_key(self, name=None):
+        """Get the details of an SSL key resource"
+
+        Keyword arguments:
+        - name: name of the key to load
+        """
+
+        # I don't know if this is a bug, but requesting .../crypto/cert/{id}
+        # and .../crypto/key/{id} doesn't work when you include "~Common~".
+        # If that part is stripped out, requests work, even though the
+        # reference URL includes that part.
+        if name:
+            if not name.endswith('.key'):
+                name = name+'.key'
+            relative_name = name.replace('~Common~', '')
+            url = self.icontrol_url('crypto_key_id', id=relative_name)
+            return self.GET(url, 'name')
+        else:
+            return None
+
+
+    def delete_crypto_key(self, name=None):
+        """Delete an SSL key resource"
+
+        Keyword arguments:
+        - name: name of the key to delete
+        """
+
+        if name:
+            if not name.endswith('.key'):
+                name = name+'.key'
+            url = self.icontrol_url('crypto_key_id', id=name)
+            return self.DELETE(url, '', 'code')
+        else:
+            return None
+
+
+    def create_ssl_profile(self, profile_name=None, servername=None,
+                           cert=None, chain=None, key=None):
+        """Create a new SSL profile on the LTM.
+
+        Uses scp to transfer the given files to /var/tmp on the LTM,
+        uses REST to install each, then uses REST to create a profile
+        that references them.
+
+        Keyword arguments:
+        - profile_name: name of an existing profile
+        - servername: name of a virtual server
+        - cert, chain, and key: strings of local file paths
+        """
+
+        if self.verbose >= 1:
+            sys.stdout.write("\n## Creating SSL profile \"{name}\"\n".format(
+                             name=profile_name))
+
+        # Upload our new certificate components.
+        if self.verbose >= 2:
+            sys.stdout.write("\n### Uploading new keychain components\n\n")
+
+        cert_date_suffix = '%Y-%m-%d-%H:%M:%S'
+        new_cert_name = '{}-{}'.format(profile_name,
+                                       datetime.datetime.now().strftime(
+                                        cert_date_suffix))
+        if self.verbose >= 2:
+            sys.stdout.write("New keychain name: " +
+                             "\"{}\"\n\n".format(new_cert_name))
+
+        # Install the new SSL private key
+        result = self.add_crypto_key(name=new_cert_name, key=key)
+        if result is False:
+            sys.stderr.write("\n")
+            print_error('''
+                Failure when installing new private certificate key;
+                aborting SSL profile creation.
+                ''')
+            sys.stderr.write("\n")
+            return False
+        else:
+            new_key = self.get_crypto_key(new_cert_name)
+
+        # Install the new SSL public certificate
+        result = self.add_crypto_cert(name=new_cert_name, cert=cert,
+                                      chain=chain)
+        if result is False:
+            sys.stderr.write("\n")
+            print_error('''
+                Failure when installing new public certificate;
+                aborting SSL profile creation.
+                ''')
+            if self.verbose:
+                sys.stderr.write("\n")
+                print_error('''
+                    Make sure you include intermediate certificates.
+                    They can be inside your cert file or specified
+                    separately as a chain file.
+                    ''')
+                sys.stderr.write("\n")
+            return False
+        else:
+            new_cert = self.get_crypto_cert(new_cert_name)
+
+        if self.verbose >= 1:
+            sys.stdout.write("    * key: {}\n".format(new_key['fullPath']))
+            sys.stdout.write("    * cert: {}\n".format(new_cert['fullPath']))
+            sys.stdout.write("    * CN: {}\n".format(new_cert['commonName']))
+            sys.stdout.write("    * SAN: {}\n".format(
+                             new_cert['subjectAlternativeName']))
+            sys.stdout.write("    * expires: {}\n".format(
+                             new_cert['apiRawValues']['expiration']))
+
+        if self.verbose >= 2:
+            sys.stdout.write("\n### Updating SSL profile with new keychain\n\n")
+
+        url = self.icontrol_url('clientssl')
+        payload = {
+          'name': profile_name,
+          'defaultsFrom': self.ssl_profile_parent,
+          'description': '{}, created {}'.format(servername, 
+                          datetime.datetime.now().strftime('%c')),
+          #'certKeyChain': {
+              'cert': '{}.crt'.format(new_cert_name),
+              'chain': '{}.crt'.format(new_cert_name),
+              'key': '{}.key'.format(new_cert_name),
+          #},
+        }
+        if servername:
+            payload['serverName'] = servername
+
+        result = self.POST(url, json.dumps(payload), 'name')
+        if result is False:
+            sys.stderr.write("error: no valid response received")
+            return False
+
+        if self.verbose >= 1:
+            sys.stdout.write("Complete! All steps succeeded.\n")
+            sys.stdout.write("New keychain for {} is {}.\n".format(
+                             profile_name, new_cert_name))
+        return True
+
+
+    def replace_ssl_profile(self, profile_name=None,
+                            cert=None, chain=None, key=None):
+        """Replace an SSL profile, swapping in new keychain components.
+        
+        If given, the local files for `cert`, `chain`, and `key` will be
+        uploaded and installed using `profile_name` as a prefix and a
+        generated suffix, so that we can know they'll be unique in the
+        system but match each other.
+
+        These files are scp'd to the LTM device using the credentials &
+        environment of the invoking user. After copying to the device, each
+        is installed.
+
+        After installation of the files, the given SSL profile is modified
+        to reference these files, and the old files are removed.
+
+        Keyword arguments:
+        - profile_name: name of an existing profile
+        - cert, chain, and key: strings of local file paths
+        """
+
+        if self.verbose >= 1:
+            sys.stdout.write("\n## Replacing keychain of SSL profile " +
+                             "\"{}\"\n".format(profile_name))
+
+        if not self.has_ssl_profile(profile_name):
+            sys.stderr.write("error: profile {} does not exist\n".format(
+                             profile_name))
+            return False
+
+        # We ought to do the REST equivalent of this:
+        # tmsh
+        # create /cli transaction
+        # modify /sys file ssl-key /Common/test.wumpus.org.key
+        #  { source-path file:/var/tmp/ltm-ssl-key.947487 }
+        # modify /sys file ssl-cert /Common/test.wumpus.org.crt
+        #  { source-path file:/var/tmp/ltm-ssl-cert.947487 }
+        # submit /cli transaction
+
+        # What can we call our new files? They need to be different than
+        # the old file names, and we need to try to make them unique so
+        # that they aren't likely to be used again. Using the current date
+        # and time seems adequate.
+        # If we use "%s" -- seconds since the UNIX epoch --
+        # we'll end up with a certificate name like "my.domain.tld-1446686767"
+        cert_date_suffix = '%Y-%m-%d-%H:%M:%S'
+        new_cert_name = '{}-{}'.format(profile_name,
+                                       datetime.datetime.now().strftime(
+                                        cert_date_suffix))
+        if self.verbose >= 2:
+            sys.stdout.write("\n* new keychain name: " +
+                             "\"{}\"\n".format(new_cert_name))
+
+        # Get info about our existing keychain.
+        # We'll use this to remove them later, if uploading new ones works.
+        profile = self.ssl_profiles[profile_name]
+        old_keychain = profile['certKeyChain'][0]
+        if self.verbose >= 3:
+            sys.stdout.write("\n### Old keychain components:\n\n")
+            sys.stdout.write("* key: {}\n".format(old_keychain['key']))
+            sys.stdout.write("* cert: {}\n".format(old_keychain['cert']))
+            sys.stdout.write("* chain: {}\n\n".format(old_keychain['chain']))
+
+        # Load the details of our old key files so we know their names
+        resource_id = old_keychain['cert'].replace('/', '~')
+        old_cert = self.get_crypto_cert(resource_id)
+        if old_keychain['chain'] != old_keychain['cert']:
+            resource_id = old_keychain['chain'].replace('/', '~')
+            old_chain = self.get_crypto_cert(resource_id)
+        else:
+            old_chain = None
+        resource_id = old_keychain['key'].replace('/', '~')
+        old_key = self.get_crypto_key(resource_id)
+
+        #
+        # Upload our new certificate components.
+        #
+
+        if self.verbose >= 2:
+            sys.stdout.write("\n### Uploading new keychain components:\n\n")
+
+        # Install the new SSL private key
+        result = self.add_crypto_key(name=new_cert_name, key=key)
+        if result is False:
+            sys.stderr.write("\n")
+            print_error('''
+                Failure when installing new private certificate key;
+                aborting SSL profile creation.
+                ''')
+            sys.stderr.write("\n")
+            return False
+        else:
+            new_key = self.get_crypto_key(new_cert_name)
+
+        # Install the new SSL public certificate
+        result = self.add_crypto_cert(name=new_cert_name, cert=cert,
+                                      chain=chain)
+        if result is False:
+            sys.stderr.write("\n")
+            print_error('''
+                Failure when installing new public certificate;
+                aborting SSL profile creation.
+                ''')
+            if self.verbose:
+                sys.stderr.write("\n")
+                print_error('''
+                    Make sure you include intermediate certificates.
+                    They can be inside your cert file or specified
+                    separately as a chain file.
+                    ''')
+                sys.stderr.write("\n")
+            return False
+        else:
+            new_cert = self.get_crypto_cert(new_cert_name)
+
+        if self.verbose >= 1:
+            #import pprint
+            #pp = pprint.PrettyPrinter(indent=4)
+            #sys.stdout.write("\n* new key:\n")
+            #pp.pprint(new_key)
+            #sys.stdout.write("\n* new cert:\n")
+            #pp.pprint(new_cert)
+            sys.stdout.write("    * key: {}\n".format(new_key['fullPath']))
+            sys.stdout.write("    * cert: {}\n".format(new_cert['fullPath']))
+            sys.stdout.write("    * CN: {}\n".format(new_cert['commonName']))
+            sys.stdout.write("    * SAN: {}\n".format(
+                             new_cert['subjectAlternativeName']))
+            sys.stdout.write("    * expires: {}\n".format(
+                             new_cert['apiRawValues']['expiration']))
+
+        # Associate the new certs with the given profile.
+        if self.verbose >= 2:
+            sys.stdout.write("\n### Associating new keychain with SSL " +
+                             "profile\n")
+
+        url = self.icontrol_url('clientssl_id', id=profile_name)
+        payload = {
+          'description': 'modified {}'.format(
+                          datetime.datetime.now().strftime('%c')),
+          #'certKeyChain': {
+              'cert': '{}.crt'.format(new_cert_name),
+              'chain': '{}.crt'.format(new_cert_name),
+              'key': '{}.key'.format(new_cert_name),
+          #},
+        }
+
+        result = self.PUT(url, json.dumps(payload), 'name')
+        if result is False:
+            sys.stderr.write("error: no valid response received")
+
+        if self.verbose >= 2:
+            sys.stdout.write("\n### Removing old keychain files\n\n")
+
+        # Our old certificate components are obsolete. We can delete them now.
+        # FIX: should use old_cert_name instead of new
+        if old_cert:
+            self.delete_crypto_cert(name=old_cert['fullPath'])
+            #self.delete_crypto_cert(name=new_cert_name+'.crt')
+        if old_chain:
+            self.delete_crypto_cert(name=old_chain['fullPath'])
+        if old_key:
+            self.delete_crypto_key(name=old_key['fullPath'])
+            #self.delete_crypto_key(name=new_cert_name+'.key')
+
+        if self.verbose >= 1:
+            sys.stdout.write("Complete! All steps succeeded.\n")
+            sys.stdout.write("New keychain for {} is {}.\n".format(
+                             profile_name, new_cert_name))
+        return True
+
+
+    def delete_ssl_profile(self, name):
+        """Delete an SSL profile
+        
+        Arguments:
+        - name: name of the profile to be removed
+        """
+
+        if self.verbose >= 1:
+            sys.stdout.write("\n## Deleting SSL profile \"{}\"\n".format(name))
+
+        url = self.icontrol_url('clientssl_id', id=name)
+        result = self.DELETE(url, '', 'code')
+        if result == False:
+            sys.stderr.write("Delete failed.\n")
+            return False
+        else:
+            if self.verbose >= 1:
+                sys.stdout.write("\nComplete. " +
+                                 "\"{}\" has been deleted\n".format(name))
+            return True
+
+
+    def associate_ssl_profile(self, name, hosts, context):
+        """Add an SSL profile to a set of virtual servers
+        
+        Arguments:
+        - name: name of the profile to be added
+        - hosts: list of hosts that should exist as virtual servers,
+                 where each name will be appended with "_443" to
+                 transform the hostname to a virtual server name.
+        - context: the context to which the profile is applied ("clientside",
+                   "serverside", or "all".
+        """
+
+        if self.verbose >= 1:
+            sys.stdout.write(("\n## Associating SSL profile \"{}\" with "
+                              "virtual servers\n\n").format(name))
+
+        for host in hosts:
+            if self.verbose >= 2:
+                sys.stdout.write("* {} -> {}\n".format(name, host))
+            result = self.add_virtual_profile(host+'_443', name, context)
+            if result == False:
+                sys.stderr.write("Association with {} failed.\n".format(host))
+                return False
+
+        if self.verbose >= 1:
+            sys.stdout.write(("Complete. \"{}\" has been added " +
+                              "to the requested servers.\n").format(name))
+        return True
+
+
+    def dissociate_ssl_profile(self, name, hosts):
+        """Remove an SSL profile from a set of virtual servers
+        
+        Arguments:
+        - name: name of the profile to be removed
+        - hosts: list of hosts that should exist as virtual servers,
+                 where each name will be appended with "_443" to
+                 transform the hostname to a virtual server name.
+        """
+
+        if self.verbose >= 1:
+            sys.stdout.write(("\n## Dissociating SSL profile \"{}\" from "
+                              "virtual servers\n\n").format(name))
+
+        for host in hosts:
+            if self.verbose >= 2:
+                sys.stdout.write("* {} -> {}\n".format(name, host))
+            result = self.delete_virtual_profile(host+'_443', name)
+            if result == False:
+                sys.stderr.write("Removal from {} failed.\n".format(host))
+                return False
+
+        if self.verbose >= 1:
+            sys.stdout.write(("Complete. \"{}\" has been removed " +
+                              "from the requested servers.\n").format(name))
+        return True
+
+
+def sigint_handler(signal, frame):
+    """Handle Control-C semi-gracefully
+    """
+
+    sys.stderr.write("{} interrupted; exiting.\n".format(
+                     os.path.basename(sys.argv[0])))
+    sys.exit(0)
+
+
+def gentlemanly_json(json_str):
+    """Format JSON data as a more legible string."
+    """
+
+    return json.dumps(json_str, sort_keys=True, indent=4,
+                      separators=(',', ': '))
+
+
+def print_error(message):
+    """Print an error message to stderr, nicely formatted
+    """
+
+    sys.stderr.write(textwrap.fill(textwrap.dedent(message).strip(), width=78)
+                     + "\n")
+
+
+def print_message(message):
+    """Print a message to stdout, nicely formatted
+    """
+
+    sys.stdout.write(textwrap.fill(textwrap.dedent(message).strip(), width=78)
+                     + "\n")
+
+
+def main():
+    global Verbose
+
+    # Set up the command-line parser and process the command-line.
+    parser = argparse.ArgumentParser(description=
+              "Manage SSL certificates and profiles on an F5 Local Traffic "+
+              "Manager")
+
+    #parser.add_argument('ssl_profile', 
+    #                    nargs='?',
+    #                    help="Name of the SSL profile to work with")
+
+    parser.add_argument('--cert',
+                        help="Signed public certificate in PEM format")
+
+    parser.add_argument('--chain',
+                        help="Certificate chain for the signed certificate")
+
+    parser.add_argument('--key',
+                        help="Private key in PEM format")
+
+    parser.add_argument('--status',
+                        action='store_true',
+                        help="Print the state of the profile")
+
+    parser.add_argument('--profile', 
+                        help="Name of the SSL profile to work with")
+
+    parser.add_argument('--server',
+                        action='append',
+                        help="Work with the given virtual server; can be used multiple times")
+
+    parser.add_argument('--show-profile',
+                        action='store_true',
+                        help="Show verbose information about the profile")
+
+    parser.add_argument('--show-servers',
+                        action='store_true',
+                        help="Show verbose information about the server " +
+                             "profiles")
+
+    parser.add_argument('--show-cert',
+                        action='store_true',
+                        help="Show verbose information about the SSL " +
+                             "certificate")
+
+    parser.add_argument('--show-key',
+                        action='store_true',
+                        help="Show verbose information about the SSL key")
+
+
+
+    action_group = parser.add_mutually_exclusive_group()
+
+    action_group.add_argument('--create',
+                        dest='action',
+                        action='store_const', const='create',
+                        help="Create a new SSL profile")
+
+    action_group.add_argument('--delete',
+                        dest='action',
+                        action='store_const', const='delete',
+                        help="... or delete one")
+
+    action_group.add_argument('--replace',
+                        dest='action',
+                        action='store_const', const='replace',
+                        help="... or replace one (mutually exclusive)")
+
+
+    host_action = parser.add_mutually_exclusive_group()
+    host_action.add_argument('--associate',
+                        action='store_true',
+                        help="Assign the profile to the given server(s)")
+
+    host_action.add_argument('--dissociate',
+                        action='store_true',
+                        help="Remove the profile from the given server(s)")
+
+
+    parser.add_argument('--version', action='version', version='0.1',
+                        help='print the version number (%(version)s)')
+    parser.add_argument('-v', '--verbose',
+                        action='count', default=0,
+                        help='increase output verbosity')
+
+    parser.add_argument('--context',
+                           choices=['clientside', 'serverside', 'all'],
+                           default='clientside',
+                           help="Apply changes to the client or server side " +
+                                "of the virtual server")
+
+    parser.add_argument('--ltm-host',
+                        default=LTM_HOST,
+                        help="Hostname or IP address of the F5 LTM " +
+                             " (default: {})".format(LTM_HOST))
+
+    parser.add_argument('--ltm-user',
+                        default=LTM_USER,
+                        help="Username for REST API authentication to the LTM" +
+                             " (default: {})".format(LTM_USER))
+
+    parser.add_argument('--ltm-password',
+                        default=LTM_PASS,
+                        help="Password for REST API authentication to the LTM" +
+                             " (default: i've got a secret!)")
+
+    # Make sure that we handle pipes gracefully.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    # Process our command-line
+    args = parser.parse_args()
+    Verbose = args.verbose
+
+    ictl = iControlREST(verbose=Verbose,
+                        user=args.ltm_user,
+                        password=args.ltm_password,
+                        hostname=args.ltm_host,
+                        ssl_profile_parent=SSL_PROFILE_PARENT)
+
+    # Make stdout unbuffered so that it lines up with stderr
+    # http://stackoverflow.com/questions/107705/disable-output-buffering
+    #gc.garbage.append(sys.stdout)
+    #sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
+    
+    if args.profile:
+        if args.verbose >= 2:
+            sys.stdout.write("\n## Profile initialization\n\n")
+
+        ictl.load_ssl_profiles()
+        if args.action != 'create' and not ictl.has_ssl_profile(args.profile):
+            sys.exit("\nProfile \"{}\" was not found.".format(args.profile))
+
+        ictl.load_ssl_certs()
+        ictl.load_ssl_keys()
+
+        if args.show_profile:
+            ictl.print_ssl_profile(args.profile)
+
+        if args.show_cert:
+            ictl.print_ssl_cert(args.profile)
+
+        if args.show_key:
+            ictl.print_ssl_key(args.profile)
+
+    if args.server:
+        for s in args.server:
+            ictl.load_virtual_profiles(s+'_443')
+
+        if args.show_servers:
+            for s in args.server:
+                ictl.print_virtual_profile(s+'_443', args.context)
+    else:
+        ictl.load_virtual_servers()
+        if args.show_servers:
+            if args.profile:
+                ictl.print_virtuals_with_profile(args.profile, args.context)
+            else:
+                ictl.print_virtual_profiles(args.context)
+
+    if args.status:
+        ictl.print_ssl_status(args.profile)
+
+    # Do profile creation or replacement before association/dissociation,
+    # just in case both were requested. Always delete last, in case
+    # the request is to dissociate then delete.
+
+    if args.action == 'create':
+        if ictl.has_ssl_profile(args.profile):
+            sys.exit("\nProfile {} already exists.\n".format(args.profile))
+        result = ictl.create_ssl_profile(profile_name=args.profile,
+                                         servername=args.profile,
+                                         cert=args.cert, chain=args.chain,
+                                         key=args.key)
+        if result is False:
+            sys.exit(2)
+    elif args.action == 'replace':
+        if not ictl.has_ssl_profile(args.profile):
+            sys.exit("\nProfile {} does not exist.\n".format(args.profile))
+        result = ictl.replace_ssl_profile(profile_name=args.profile,
+                                          cert=args.cert, chain=args.chain,
+                                          key=args.key)
+        if result is False:
+            sys.exit(2)
+
+    if args.associate:
+        ictl.associate_ssl_profile(args.profile, args.server, args.context)
+
+        if args.show_servers:
+            sys.stdout.write("\n## Virtual server profiles after changes:\n")
+            ictl.verbose = 0
+            for s in args.server:
+                ictl.load_virtual_profiles(s+'_443')
+                ictl.print_virtual_profile(s+'_443', args.context)
+
+    if args.dissociate:
+        ictl.dissociate_ssl_profile(args.profile, args.server)
+
+        if args.show_servers:
+            sys.stdout.write("\n## Virtual server profiles after changes:\n")
+            ictl.verbose = 0
+            for s in args.server:
+                ictl.load_virtual_profiles(s+'_443')
+                ictl.print_virtual_profile(s+'_443', args.context)
+
+    if args.action == 'delete':
+        ictl.delete_ssl_profile(args.profile)
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, sigint_handler)
+    try:
+        main()
+    except KeyboardInterrupt:
+        sigint_handler()
