@@ -10,6 +10,7 @@ Manage SSL certificates and profiles on F5 Local Traffic Managers
 This script uses the F5 iControl RESET interface. See also:
 https://devcentral.f5.com/wiki/iControlrest.HomePage.ashx
 
+Copyright (c) 2016 O'Shaughnessy Evans <shaug + github-ltm-ssl @ wumpus.org>
 '''
 
 import argparse
