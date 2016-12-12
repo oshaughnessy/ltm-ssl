@@ -17,12 +17,12 @@ change these:
 
 or pass them using command-line options:
 
-  --ltm-host LTM_HOST   Hostname or IP address of the F5 LTM (default: FIXME)
-  --ltm-user LTM_USER   Username for REST API authentication to the LTM
-                        (default: FIXME)
-  --ltm-password LTM_PASSWORD
-                        Password for REST API authentication to the LTM
-                        (default: i've got a secret!)
+    --ltm-host LTM_HOST   Hostname or IP address of the F5 LTM (default: FIXME)
+    --ltm-user LTM_USER   Username for REST API authentication to the LTM
+                          (default: FIXME)
+    --ltm-password LTM_PASSWORD
+                          Password for REST API authentication to the LTM
+                          (default: i've got a secret!)
 
 
 ## Usage
